@@ -1,0 +1,967 @@
+ diff -Nurw react-native-webrtc-1.57.0/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java react-native-webrtc/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java
+--- react-native-webrtc-1.57.0/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java	2017-04-07 02:19:20.000000000 +0200
++++ react-native-webrtc/android/src/main/java/com/oney/WebRTCModule/WebRTCModule.java	2017-06-13 17:50:40.000000000 +0200
+@@ -2,7 +2,15 @@
+ 
+ import android.app.Application;
+ 
++import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
++import android.graphics.Matrix;
++import android.graphics.Rect;
++import android.media.MediaScannerConnection;
++import android.net.Uri;
++import android.os.Environment;
+ import android.os.Handler;
++import android.os.HandlerThread;
+ import android.provider.ContactsContract;
+ import android.support.annotation.Nullable;
+ 
+@@ -21,7 +29,14 @@
+ import com.facebook.react.bridge.ReadableType;
+ import com.facebook.react.modules.core.DeviceEventManagerModule;
+ 
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -57,14 +72,33 @@
+     public final Map<String, MediaStream> mMediaStreams;
+     public final Map<String, MediaStreamTrack> mMediaStreamTracks;
+     private final Map<String, VideoCapturer> mVideoCapturers;
++    private final Map<String, Camera> mCameras;
++    private final MediaConstraints pcConstraints = new MediaConstraints();
++
++    public static final int RCT_CAMERA_CAPTURE_TARGET_MEMORY = 0;
++    public static final int RCT_CAMERA_CAPTURE_TARGET_DISK = 1;
++    public static final int RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL = 2;
++    public static final int RCT_CAMERA_CAPTURE_TARGET_TEMP = 3;
++
++    private final HandlerThread imageProcessingThread;
++    private Handler imagePorcessingHandler;
+ 
+     public WebRTCModule(ReactApplicationContext reactContext) {
+         super(reactContext);
+ 
++        imageProcessingThread = new HandlerThread("PictureProcessing");
++        imageProcessingThread.start();
++        imagePorcessingHandler = new Handler(imageProcessingThread.getLooper());
++
+         mPeerConnectionObservers = new SparseArray<PeerConnectionObserver>();
+         mMediaStreams = new HashMap<String, MediaStream>();
+         mMediaStreamTracks = new HashMap<String, MediaStreamTrack>();
+         mVideoCapturers = new HashMap<String, VideoCapturer>();
++        mCameras = new HashMap<>();
++
++        pcConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"));
++        pcConstraints.mandatory.add(new MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"));
++        pcConstraints.optional.add(new MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"));
+ 
+         PeerConnectionFactory.initializeAndroidGlobals(reactContext, true, true, true);
+         mFactory = new PeerConnectionFactory();
+@@ -84,9 +118,21 @@
+     public Map<String, Object> getConstants() {
+         final Map<String, Object> constants = new HashMap<>();
+         constants.put(LANGUAGE, getCurrentLanguage());
++        constants.put("CaptureTarget", getCaptureTargetConstants());
+         return constants;
+     }
+ 
++    private Map<String, Object> getCaptureTargetConstants() {
++        return Collections.unmodifiableMap(new HashMap<String, Object>() {
++            {
++                put("memory", RCT_CAMERA_CAPTURE_TARGET_MEMORY);
++                put("temp", RCT_CAMERA_CAPTURE_TARGET_TEMP);
++                put("cameraRoll", RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL);
++                put("disk", RCT_CAMERA_CAPTURE_TARGET_DISK);
++            }
++        });
++    }
++
+     @ReactMethod
+     public void getLanguage(Callback callback){
+         String language = getCurrentLanguage();
+@@ -741,6 +788,408 @@
+         callback.invoke(array);
+     }
+ 
++
++    private int getFrameOrientation(CameraSession cameraSession) throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
++        Method getFrameOrientation = cameraSession.getClass().getDeclaredMethod("getFrameOrientation");
++        getFrameOrientation.setAccessible(true);
++        return (Integer) getFrameOrientation.invoke(cameraSession);
++    }
++
++    private synchronized void processPicture(byte[] jpeg, int captureTarget, double maxJpegQuality,
++                                             int maxSize, int orientation, List<String> paths,
++                                             Callback successCallback, Callback errorCallback,
++                                             String streamId, int totalPictures) {
++
++        Log.d(TAG, "Processing picture");
++        try {
++            String path = savePicture(jpeg, captureTarget, maxJpegQuality, maxSize, orientation);
++
++            Log.d(TAG, "Saved picture to " + path);
++
++            paths.add(path);
++
++            if (paths.size() == totalPictures) {
++                WritableArray pathsArray = Arguments.createArray();
++                for (String p : paths) {
++                    pathsArray.pushString(p);
++                }
++                successCallback.invoke(pathsArray);
++                imagePorcessingHandler.removeCallbacksAndMessages(null);
++            }
++        } catch (IOException e) {
++            String message = "Could not save picture for stream id " + streamId;
++            Log.d(TAG, message, e);
++            errorCallback.invoke(message);
++            imagePorcessingHandler.removeCallbacksAndMessages(null);
++        }
++    }
++
++    @SuppressWarnings("deprecation")
++    @ReactMethod
++    public void takePicture(final ReadableMap options, final Callback successCallback, final Callback errorCallback) {
++
++        final String streamId = options.getString("streamId");
++        final int captureTarget = options.getInt("captureTarget");
++        final double maxJpegQuality = options.getDouble("maxJpegQuality");
++        final int maxSize = options.getInt("maxSize");
++
++        VideoCapturer videoCapturer;
++        try {
++            videoCapturer = getVideoCapturer(streamId);
++        } catch (Exception e) {
++            String message = "Error getting video capturer instance for stream id " + streamId;
++            Log.d(TAG, message, e);
++            errorCallback.invoke(message);
++            return;
++        }
++
++        CameraSession cameraSession;
++        try {
++            cameraSession = getCameraSessionInstance(videoCapturer);
++        } catch(Exception e) {
++            String message = "Error getting camera session instance for stream id " + streamId;
++            Log.d(TAG, message, e);
++            errorCallback.invoke(message);
++            return;
++        }
++
++        Camera camera;
++        try {
++            camera = getCameraInstance(cameraSession);
++        } catch (Exception e) {
++            String message = "Error getting camera instance for stream id " + streamId;
++            Log.d(TAG, message, e);
++            errorCallback.invoke(message);
++            return;
++        }
++
++        int orientation = -1;
++        try {
++            orientation = getFrameOrientation(cameraSession);
++        } catch (Exception e) {
++            Log.d(TAG, "Error getting frame orientation for stream id " + streamId, e);
++        }
++
++        final int finalOrientation = orientation;
++        camera.takePicture(null, null, new Camera.PictureCallback() {
++            @Override
++            public void onPictureTaken(final byte[] jpeg, final Camera camera) {
++
++                imagePorcessingHandler.post(new Runnable() {
++                    @Override
++                    public void run() {
++                        if (captureTarget == RCT_CAMERA_CAPTURE_TARGET_MEMORY) {
++                            String encoded = Base64.encodeToString(jpeg, Base64.DEFAULT);
++                            successCallback.invoke(encoded);
++                        } else {
++                            try {
++                                String path = savePicture(jpeg, captureTarget, maxJpegQuality, maxSize, finalOrientation);
++                                successCallback.invoke(path);
++                            } catch (IOException e) {
++                                String message = "Error saving picture";
++                                Log.d(TAG, message, e);
++                                errorCallback.invoke(message);
++                            }
++                        }
++                    }
++                });
++            }
++        });
++    }
++
++    private VideoCapturer getVideoCapturer(String streamId) throws Exception {
++        if (!mVideoCapturers.containsKey(streamId)) {
++            throw new Exception("Could not get video capturer for stream id " + streamId);
++        }
++
++        return mVideoCapturers.get(streamId);
++    }
++
++    @SuppressWarnings("deprecation")
++    private CameraSession getCameraSessionInstance(VideoCapturer videoCapturer) throws Exception {
++        // TODO: only works for camera1.. implement for camera2
++        CameraSession cameraSession = null;
++        if(videoCapturer instanceof CameraCapturer) {
++            Field cameraSessionField = CameraCapturer.class.getDeclaredField("currentSession");
++            cameraSessionField.setAccessible(true);
++
++            cameraSession = (CameraSession) cameraSessionField.get(videoCapturer);
++        }
++
++        if (cameraSession == null) {
++            throw new Exception("Could not get camera session instance");
++        }
++
++        return cameraSession;
++    }
++
++    @SuppressWarnings("deprecation")
++    private Camera getCameraInstance(CameraSession cameraSession) throws Exception {
++        // TODO: only works for camera1.. implement for camera2
++        Camera camera = null;
++
++        Field cameraField = cameraSession.getClass().getDeclaredField("camera");
++        cameraField.setAccessible(true);
++
++        camera = (Camera) cameraField.get(cameraSession);
++
++        if (camera == null) {
++            throw new Exception("Could not get camera instance");
++        }
++
++        return camera;
++    }
++
++    private synchronized String savePicture(byte[] jpeg, int captureTarget, double maxJpegQuality, int maxSize,
++                                            int orientation) throws IOException {
++
++        // TODO: check if rotation is needed
++//        int rotationAngle = currentFrame.rotationDegree;
++
++        String filename = UUID.randomUUID().toString();
++        File file = null;
++        switch (captureTarget) {
++            case RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL: {
++                file = getOutputCameraRollFile(filename);
++                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
++                addToMediaStore(file.getAbsolutePath());
++                break;
++            }
++            case RCT_CAMERA_CAPTURE_TARGET_DISK: {
++                file = getOutputMediaFile(filename);
++                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
++                break;
++            }
++            case RCT_CAMERA_CAPTURE_TARGET_TEMP: {
++                file = getTempMediaFile(filename);
++                writePictureToFile(jpeg, file, maxSize, maxJpegQuality, orientation);
++                break;
++            }
++        }
++
++        return Uri.fromFile(file).toString();
++    }
++
++    private String writePictureToFile(byte[] jpeg, File file, int maxSize, double jpegQuality, int orientation) throws IOException {
++
++        FileOutputStream output = new FileOutputStream(file);
++        output.write(jpeg);
++        output.close();
++
++        Matrix matrix = new Matrix();
++        Log.d(TAG, "orientation " + orientation);
++        if (orientation != 0) {
++            matrix.postRotate(orientation);
++        }
++
++        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
++
++        // scale if needed
++        int width = bitmap.getWidth();
++        int height = bitmap.getHeight();
++
++        // only resize if image larger than maxSize
++        if (width > maxSize && width > maxSize) {
++            Rect originalRect = new Rect(0, 0, width, height);
++            Rect scaledRect = scaleDimension(originalRect, maxSize);
++
++            Log.d(TAG, "scaled width = " + scaledRect.width() + ", scaled height = " + scaledRect.height());
++
++            // calculate the scale
++            float scaleWidth = ((float) scaledRect.width()) / width;
++            float scaleHeight = ((float) scaledRect.height()) / height;
++
++            matrix.postScale(scaleWidth, scaleHeight);
++        }
++
++        FileOutputStream finalOutput = new FileOutputStream(file, false);
++
++        int compression = (int) (100 * jpegQuality);
++        Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
++        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, compression, finalOutput);
++
++        finalOutput.close();
++
++        return file.getAbsolutePath();
++    }
++
++    private File getOutputMediaFile(String fileName) {
++        // Get environment directory type id from requested media type.
++        String environmentDirectoryType;
++        environmentDirectoryType = Environment.DIRECTORY_PICTURES;
++
++        return getOutputFile(
++                fileName + ".jpeg",
++                Environment.getExternalStoragePublicDirectory(environmentDirectoryType)
++        );
++    }
++
++    private File getOutputCameraRollFile(String fileName) {
++        return getOutputFile(
++                fileName + ".jpeg",
++                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
++        );
++    }
++
++    private File getOutputFile(String fileName, File storageDir) {
++        // Create the storage directory if it does not exist
++        if (!storageDir.exists()) {
++            if (!storageDir.mkdirs()) {
++                Log.e(TAG, "failed to create directory:" + storageDir.getAbsolutePath());
++                return null;
++            }
++        }
++
++        return new File(String.format("%s%s%s", storageDir.getPath(), File.separator, fileName));
++    }
++
++    private File getTempMediaFile(String fileName) {
++        try {
++            File outputDir = getReactApplicationContext().getCacheDir();
++            File outputFile;
++
++            outputFile = File.createTempFile(fileName, ".jpg", outputDir);
++
++            return outputFile;
++        } catch (Exception e) {
++            Log.e(TAG, e.getMessage());
++            return null;
++        }
++    }
++
++    private void addToMediaStore(String path) {
++        MediaScannerConnection.scanFile(getReactApplicationContext(), new String[]{path}, null, null);
++    }
++
++    private static Rect scaleDimension(Rect originalRect, int maxSize) {
++
++        int originalWidth = originalRect.width();
++        int originalHeight = originalRect.height();
++        int newWidth = originalWidth;
++        int newHeight = originalHeight;
++
++        // first check if we need to scale width
++        if (originalWidth > maxSize) {
++            //scale width to fit
++            newWidth = maxSize;
++            //scale height to maintain aspect ratio
++            newHeight = (newWidth * originalHeight) / originalWidth;
++        }
++
++        // then check if we need to scale even with the new height
++        if (newHeight > maxSize) {
++            //scale height to fit instead
++            newHeight = maxSize;
++            //scale width to maintain aspect ratio
++            newWidth = (newHeight * originalWidth) / originalHeight;
++        }
++
++        return new Rect(0, 0, newWidth, newHeight);
++    }
++
+     @ReactMethod
+     public void mediaStreamTrackStop(final String id) {
+         // Is this functionality equivalent to `mediaStreamTrackRelease()` ?
+@@ -804,15 +1253,23 @@
+             stream.removeTrack((VideoTrack)track);
+             removeVideoCapturer(_trackId);
+         }
++
++        imagePorcessingHandler.removeCallbacksAndMessages(null);
++        imageProcessingThread.quit();
+     }
+ 
++    @SuppressWarnings("deprecation")
+     public WritableMap getCameraInfo(int index) {
+         CameraInfo info = new CameraInfo();
+ 
++        Size size = null;
+         try {
+             Camera.getCameraInfo(index, info);
+-        } catch (Exception e) {
+-            Logging.e("CameraEnumerationAndroid", "getCameraInfo failed on index " + index, e);
++            Camera camera = Camera.open(index);
++            size = getMaxSupportedVideoSize(camera);
++            camera.release();
++        } catch (Exception var3) {
++            Logging.e("CameraEnumerationAndroid", "getCameraInfo failed on index " + index, var3);
+             return null;
+         }
+         WritableMap params = Arguments.createMap();
+@@ -821,10 +1278,48 @@
+         params.putString("id", "" + index);
+         params.putString("facing", facing);
+         params.putString("kind", "video");
++        params.putString("maxWidth", String.valueOf(size.width));
++        params.putString("maxHeight", String.valueOf(size.height));
+ 
+         return params;
+     }
+ 
++    private class Size {
++        final int width;
++        final int height;
++
++        public Size(int width, int height) {
++            this.width = width;
++            this.height = height;
++        }
++    }
++
++    @SuppressWarnings("deprecation")
++    private Size getMaxSupportedVideoSize(Camera camera) {
++
++        List<Camera.Size> sizes;
++
++        if (camera.getParameters().getSupportedVideoSizes() != null) {
++            sizes = camera.getParameters().getSupportedVideoSizes();
++        } else {
++            // Video sizes may be null, which indicates that all the supported
++            // preview sizes are supported for video recording.
++            sizes = camera.getParameters().getSupportedPreviewSizes();
++        }
++
++        int maxWidth = sizes.get(0).width;
++        int maxHeight = sizes.get(0).height;
++
++        for (Camera.Size size : sizes) {
++            if (size.height > maxWidth && size.width > maxHeight) {
++                maxWidth = size.width;
++                maxHeight = size.height;
++            }
++        }
++
++        return new Size(maxWidth, maxHeight);
++    }
++
+     /**
+      * Create video capturer via given facing mode
+      * @param enumerator a <tt>CameraEnumerator</tt> provided by webrtc
+@@ -893,6 +1388,10 @@
+             }
+             mVideoCapturers.remove(id);
+         }
++
++        if (mCameras.containsKey(id)) {
++            mCameras.remove(id);
++        }
+     }
+ 
+     @ReactMethod
+ diff -Nurw react-native-webrtc-1.57.0/ios/RCTWebRTC/WebRTCModule+RTCMediaStream.m react-native-webrtc/ios/RCTWebRTC/WebRTCModule+RTCMediaStream.m
+--- react-native-webrtc-1.57.0/ios/RCTWebRTC/WebRTCModule+RTCMediaStream.m	2017-04-07 02:19:20.000000000 +0200
++++ react-native-webrtc/ios/RCTWebRTC/WebRTCModule+RTCMediaStream.m	2017-06-13 17:50:40.000000000 +0200
+@@ -6,12 +6,16 @@
+ //
+ 
+ #import <objc/runtime.h>
++#import <sys/utsname.h>
+ 
+ #import <WebRTC/RTCAVFoundationVideoSource.h>
+ #import <WebRTC/RTCVideoTrack.h>
+ #import <WebRTC/RTCMediaConstraints.h>
+ 
+ #import "WebRTCModule+RTCPeerConnection.h"
++#import <AssetsLibrary/ALAssetsLibrary.h>
++#import <AVFoundation/AVFoundation.h>
++#import <ImageIO/ImageIO.h>
+ 
+ @implementation AVCaptureDevice (React)
+ 
+@@ -28,6 +32,8 @@
+ 
+ @implementation WebRTCModule (RTCMediaStream)
+ 
++AVCaptureStillImageOutput *stillImageOutput;
++
+ /**
+  * {@link https://www.w3.org/TR/mediacapture-streams/#navigatorusermediaerrorcallback}
+  */
+@@ -38,6 +44,13 @@
+  */
+ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream *mediaStream);
+ 
++typedef NS_ENUM(NSInteger, RCTCameraCaptureTarget) {
++    RCTCameraCaptureTargetMemory = 0,
++    RCTCameraCaptureTargetDisk = 1,
++    RCTCameraCaptureTargetTemp = 2,
++    RCTCameraCaptureTargetCameraRoll = 3
++};
++
+ - (RTCMediaConstraints *)defaultMediaStreamConstraints {
+   RTCMediaConstraints* constraints =
+   [[RTCMediaConstraints alloc]
+@@ -46,6 +59,238 @@
+   return constraints;
+ }
+ 
++- (NSDictionary *)constantsToExport
++{
++    return @{
++             @"CaptureTarget": @{
++                     @"memory": @(RCTCameraCaptureTargetMemory),
++                     @"disk": @(RCTCameraCaptureTargetDisk),
++                     @"temp": @(RCTCameraCaptureTargetTemp),
++                     @"cameraRoll": @(RCTCameraCaptureTargetCameraRoll)
++                     }
++             };
++}
++
++RCT_EXPORT_METHOD(takePicture:(NSDictionary *)options
++                  successCallback:(RCTResponseSenderBlock)successCallback
++                  errorCallback:(RCTResponseSenderBlock)errorCallback) {
++
++    NSInteger captureTarget = [[options valueForKey:@"captureTarget"] intValue];
++    NSInteger maxSize = [[options valueForKey:@"maxSize"] intValue];
++    CGFloat jpegQuality = [[options valueForKey:@"maxJpegQuality"] floatValue];
++
++
++    if(jpegQuality < 0) {
++        jpegQuality = 0;
++    } else if(jpegQuality > 1) {
++        jpegQuality = 1;
++    }
++
++    [stillImageOutput captureStillImageAsynchronouslyFromConnection:[stillImageOutput connectionWithMediaType:AVMediaTypeVideo] completionHandler:^(CMSampleBufferRef imageDataSampleBuffer, NSError *error) {
++
++        if (imageDataSampleBuffer) {
++            NSData *imageData = [AVCaptureStillImageOutput jpegStillImageNSDataRepresentation:imageDataSampleBuffer];
++
++            // Create image source
++            CGImageSourceRef source = CGImageSourceCreateWithData((CFDataRef)imageData, NULL);
++            // Get all the metadata in the image
++            NSMutableDictionary *imageMetadata = [(NSDictionary *) CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL)) mutableCopy];
++
++            // Create cgimage
++            CGImageRef CGImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
++
++            // Resize cgimage
++            CGImage = [self resizeCGImage:CGImage maxSize:maxSize];
++
++            // Rotate it
++            CGImageRef rotatedCGImage;
++
++            // Get metadata orientation
++            int metadataOrientation = [[imageMetadata objectForKey:(NSString *)kCGImagePropertyOrientation] intValue];
++
++            if (metadataOrientation == 6) {
++                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:270];
++            } else if (metadataOrientation == 1) {
++                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
++            } else if (metadataOrientation == 3) {
++                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:180];
++            } else {
++                rotatedCGImage = [self newCGImageRotatedByAngle:CGImage angle:0];
++            }
++
++            CGImageRelease(CGImage);
++
++            // Erase metadata orientation
++            [imageMetadata removeObjectForKey:(NSString *)kCGImagePropertyOrientation];
++            // Erase stupid TIFF stuff
++            [imageMetadata removeObjectForKey:(NSString *)kCGImagePropertyTIFFDictionary];
++
++
++            // Create destination thing
++            NSMutableData *rotatedImageData = [NSMutableData data];
++            CGImageDestinationRef destinationRef = CGImageDestinationCreateWithData((CFMutableDataRef)rotatedImageData, CGImageSourceGetType(source), 1, NULL);
++            CFRelease(source);
++
++            // Set compression
++            NSDictionary *properties = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(jpegQuality)};
++            CGImageDestinationSetProperties(destinationRef,
++                                            (__bridge CFDictionaryRef)properties);
++
++            // Add the image to the destination, reattaching metadata
++            CGImageDestinationAddImage(destinationRef, rotatedCGImage, (CFDictionaryRef) imageMetadata);
++
++            // And write
++            CGImageDestinationFinalize(destinationRef);
++            CFRelease(destinationRef);
++
++
++            [self saveImage:rotatedImageData target:captureTarget metadata:imageMetadata success:successCallback error:errorCallback];
++        }
++        else {
++            errorCallback(@[error.description]);
++        }
++    }];
++}
++
++- (CGImageRef)resizeCGImage:(CGImageRef)image maxSize:(int)maxSize {
++
++    size_t originalWidth = CGImageGetWidth(image);
++    size_t originalHeight = CGImageGetHeight(image);
++
++    // only resize if image larger than maxSize
++    if(originalWidth <= maxSize && originalHeight <= maxSize) {
++        return image;
++    }
++
++    size_t newWidth = originalWidth;
++    size_t newHeight = originalHeight;
++
++    // first check if we need to scale width
++    if (originalWidth > maxSize) {
++        //scale width to fit
++        newWidth = maxSize;
++        //scale height to maintain aspect ratio
++        newHeight = (newWidth * originalHeight) / originalWidth;
++    }
++
++    // then check if we need to scale even with the new height
++    if (newHeight > maxSize) {
++        //scale height to fit instead
++        newHeight = maxSize;
++        //scale width to maintain aspect ratio
++        newWidth = (newHeight * originalWidth) / originalHeight;
++    }
++
++    // create context, keeping original image properties
++    CGColorSpaceRef colorspace = CGImageGetColorSpace(image);
++    CGContextRef context = CGBitmapContextCreate(NULL, newWidth, newHeight,
++                                                 CGImageGetBitsPerComponent(image),
++                                                 CGImageGetBytesPerRow(image),
++                                                 colorspace,
++                                                 CGImageGetAlphaInfo(image));
++    CGColorSpaceRelease(colorspace);
++
++    if(context == NULL)
++        return image;
++
++
++
++    // draw image to context (resizing it)
++    CGContextDrawImage(context, CGRectMake(0, 0, newWidth, newHeight), image);
++    // extract resulting image from context
++    CGImageRef imgRef = CGBitmapContextCreateImage(context);
++    CGContextRelease(context);
++
++    return imgRef;
++}
++
++- (void)saveImage:(NSData*)imageData target:(NSInteger)target metadata:(NSDictionary *)metadata success:(RCTResponseSenderBlock)successCallback error:(RCTResponseSenderBlock)errorCallback {
++
++    if (target == RCTCameraCaptureTargetMemory) {
++        NSString* base64encodedImage =[imageData base64EncodedStringWithOptions:0];
++        successCallback(@[base64encodedImage]);
++        return;
++    }
++
++    else if (target == RCTCameraCaptureTargetDisk) {
++        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
++        NSString *documentsDirectory = [paths firstObject];
++
++        NSFileManager *fileManager = [NSFileManager defaultManager];
++        NSString *fullPath = [[documentsDirectory stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]] stringByAppendingPathExtension:@"jpg"];
++
++        [fileManager createFileAtPath:fullPath contents:imageData attributes:nil];
++
++        successCallback(@[fullPath]);
++        return;
++    }
++
++    else if (target == RCTCameraCaptureTargetCameraRoll) {
++        [[[ALAssetsLibrary alloc] init] writeImageDataToSavedPhotosAlbum:imageData metadata:metadata completionBlock:^(NSURL* url, NSError* error) {
++            if (error == nil) {
++                successCallback(@[[url absoluteString]]);
++            }
++            else {
++                errorCallback(@[error.description]);
++            }
++        }];
++        return;
++    }
++
++    else if (target == RCTCameraCaptureTargetTemp) {
++        NSString *fileName = [[NSProcessInfo processInfo] globallyUniqueString];
++        NSString *fullPath = [NSString stringWithFormat:@"%@%@.jpg", NSTemporaryDirectory(), fileName];
++
++        // TODO: check if image successfully stored
++        [imageData writeToFile:fullPath atomically:YES];
++        successCallback(@[fullPath]);
++
++        // NSError* error;
++        // [imageData writeToFile:fullPath atomically:YES error:&error];
++
++        // if(error != nil) {
++        //     errorCallback(@[error.description]);
++        // } else {
++        //     successCallback(@[fullPath])
++        // }
++    }
++}
++
++- (CGImageRef)newCGImageRotatedByAngle:(CGImageRef)imgRef angle:(CGFloat)angle
++{
++    CGFloat angleInRadians = angle * (M_PI / 180);
++    CGFloat width = CGImageGetWidth(imgRef);
++    CGFloat height = CGImageGetHeight(imgRef);
++
++    CGRect imgRect = CGRectMake(0, 0, width, height);
++    CGAffineTransform transform = CGAffineTransformMakeRotation(angleInRadians);
++    CGRect rotatedRect = CGRectApplyAffineTransform(imgRect, transform);
++
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGContextRef bmContext = CGBitmapContextCreate(NULL, rotatedRect.size.width, rotatedRect.size.height, 8, 0, colorSpace, (CGBitmapInfo) kCGImageAlphaPremultipliedFirst);
++
++    // if (self.mirrorImage) {
++    //     CGAffineTransform transform = CGAffineTransformMakeTranslation(rotatedRect.size.width, 0.0);
++    //     transform = CGAffineTransformScale(transform, -1.0, 1.0);
++    //     CGContextConcatCTM(bmContext, transform);
++    // }
++
++    CGContextSetAllowsAntialiasing(bmContext, TRUE);
++    CGContextSetInterpolationQuality(bmContext, kCGInterpolationNone);
++
++    CGColorSpaceRelease(colorSpace);
++
++    CGContextTranslateCTM(bmContext, +(rotatedRect.size.width/2), +(rotatedRect.size.height/2));
++    CGContextRotateCTM(bmContext, angleInRadians);
++    CGContextTranslateCTM(bmContext, -(rotatedRect.size.width/2), -(rotatedRect.size.height/2));
++
++    CGContextDrawImage(bmContext, CGRectMake((rotatedRect.size.width-width)/2.0f, (rotatedRect.size.height-height)/2.0f, width, height), imgRef);
++
++    CGImageRef rotatedImage = CGBitmapContextCreateImage(bmContext);
++    CFRelease(bmContext);
++    return rotatedImage;
++}
++
+ /**
+  * Initializes a new {@link RTCAudioTrack} which satisfies specific constraints,
+  * adds it to a specific {@link RTCMediaStream}, and reports success to a
+@@ -265,7 +510,27 @@
+ 
+   if (videoDevice) {
+     // TODO: Actually use constraints...
+-    RTCAVFoundationVideoSource *videoSource = [self.peerConnectionFactory avFoundationVideoSourceWithConstraints:[self defaultMediaStreamConstraints]];
++
++        NSDictionary *mandatoryConstraints = [videoConstraints valueForKey:@"mandatory"];
++
++        if (mandatoryConstraints &&
++            [mandatoryConstraints objectForKey:@"minWidth"] &&
++            [mandatoryConstraints objectForKey:@"minHeight"]) {
++
++            NSString *minWidth = [[mandatoryConstraints valueForKey:@"minWidth"] stringValue];
++            NSString *minHeight = [[mandatoryConstraints valueForKey:@"minHeight"] stringValue];
++
++            mandatoryConstraints = @{
++                                     @"minWidth": minWidth,
++                                     @"minHeight": minHeight,
++                                     };
++        } else {
++            mandatoryConstraints == nil;
++        }
++
++        RTCMediaConstraints *rtcMediaContraints = [[RTCMediaConstraints alloc] initWithMandatoryConstraints:mandatoryConstraints optionalConstraints:nil];
++
++        RTCAVFoundationVideoSource *videoSource = [self.peerConnectionFactory avFoundationVideoSourceWithConstraints:rtcMediaContraints];
+     // FIXME The effort above to find a videoDevice value which satisfies the
+     // specified constraints was pretty much wasted. Salvage facingMode for
+     // starters because it is kind of a common and hence important feature on
+@@ -285,8 +550,25 @@
+     RTCVideoTrack *videoTrack = [self.peerConnectionFactory videoTrackWithSource:videoSource trackId:trackUUID];
+     [mediaStream addVideoTrack:videoTrack];
+ 
++        AVCaptureSession *captureSession = videoSource.captureSession;
++
++        // setup output for still image
++        stillImageOutput = [[AVCaptureStillImageOutput alloc] init];
++        [stillImageOutput setHighResolutionStillImageOutputEnabled:true];
++
++        NSDictionary *outputSettings = @{ AVVideoCodecKey : AVVideoCodecJPEG};
++
++        [stillImageOutput setOutputSettings:outputSettings];
++
++        if ([captureSession canAddOutput:stillImageOutput])
++        {
++            [captureSession addOutput:stillImageOutput];
+     successCallback(mediaStream);
+   } else {
++            // TODO: error message
++            //erroCallback();
++        }
++  } else {
+     // According to step 6.2.3 of the getUserMedia() algorithm, if there is no
+     // source, fail with a new OverconstrainedError.
+     errorCallback(@"OverconstrainedError", /* errorMessage */ nil);
+@@ -310,12 +592,34 @@
+ RCT_EXPORT_METHOD(mediaStreamTrackGetSources:(RCTResponseSenderBlock)callback) {
+   NSMutableArray *sources = [NSMutableArray array];
+   NSArray *videoDevices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
++
++    NSDictionary *resolutions =  [self maxCameraResolutions];
++
++    NSArray *frontResolutions = [resolutions valueForKey:@"front"];
++    NSArray *backResolutions = [resolutions valueForKey:@"back"];
++
+   for (AVCaptureDevice *device in videoDevices) {
++
++        NSString *facing = device.positionString;
++
++        NSArray *res;
++
++        if(facing == @"front") {
++            res = frontResolutions;
++        } else {
++            res = backResolutions;
++        }
++
++        NSString *maxWidth = [res valueForKey:@"width"];
++        NSString *maxHeight = [res valueForKey:@"height"];;
++
+     [sources addObject:@{
+                          @"facing": device.positionString,
+                          @"id": device.uniqueID,
+                          @"label": device.localizedName,
+                          @"kind": @"video",
++                             @"maxWidth": maxWidth,
++                             @"maxHeight": maxHeight,
+                          }];
+   }
+   NSArray *audioDevices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+@@ -330,6 +634,112 @@
+   callback(@[sources]);
+ }
+ 
++- (NSString*) deviceName {
++    struct utsname systemInfo;
++    uname(&systemInfo);
++
++    return [NSString stringWithCString:systemInfo.machine
++                              encoding:NSUTF8StringEncoding];
++}
++
++- (NSDictionary*) createResolutionDict: (NSNumber*) frontCamWidth
++                        frontCamHeight: (NSNumber*) frontCamHeight
++                          backCamWidth: (NSNumber*) backCamWidth
++                         backCamHeight: (NSNumber*) backCamHeight{
++
++    NSDictionary* frontCam = @{@"width":frontCamWidth,
++                              @"height":frontCamHeight};
++
++    NSDictionary* backCam = @{@"width":backCamWidth,
++                             @"height":backCamHeight};
++
++    return @{@"front":frontCam, @"back":backCam};
++}
++
++- (NSDictionary*) maxCameraResolutions {
++    NSString* deviceModel = [self deviceName];
++    NSDictionary* resolutions = nil;
++
++
++    // iPhone 4S
++    if ([deviceModel isEqualToString:@"iPhone4,1"]) {
++        resolutions = [self createResolutionDict:@640 frontCamHeight:@480 backCamWidth:@3264 backCamHeight:@2448];
++    }
++    // iPhone 5/5C/5S/6/6+/iPod 6
++    else if ([deviceModel isEqualToString:@"iPhone5,1"]
++             || [deviceModel isEqualToString:@"iPhone5,2"]
++             || [deviceModel isEqualToString:@"iPhone5,3"]
++             || [deviceModel isEqualToString:@"iPhone5,4"]
++             || [deviceModel isEqualToString:@"iPhone6,1"]
++             || [deviceModel isEqualToString:@"iPhone6,2"]
++             || [deviceModel isEqualToString:@"iPhone7,1"]
++             || [deviceModel isEqualToString:@"iPhone7,2"]
++             || [deviceModel isEqualToString:@"iPod7,1"]) {
++        resolutions = [self createResolutionDict:@1280 frontCamHeight:@960 backCamWidth:@3264 backCamHeight:@2448];
++    }
++    // iPhone 6S/6S+
++    else if ([deviceModel isEqualToString:@"iPhone8,1"]
++             || [deviceModel isEqualToString:@"iPhone8,2"]) {
++        resolutions = [self createResolutionDict:@1280 frontCamHeight:@960 backCamWidth:@4032 backCamHeight:@3024];
++    }
++    // iPad 2
++    else if ([deviceModel isEqualToString:@"iPad2,1"]
++             || [deviceModel isEqualToString:@"iPad2,2"]
++             || [deviceModel isEqualToString:@"iPad2,3"]
++             || [deviceModel isEqualToString:@"iPad2,4"]) {
++        resolutions = [self createResolutionDict:@640 frontCamHeight:@480 backCamWidth:@1280 backCamHeight:@720];
++    }
++    // iPad 3
++    else if ([deviceModel isEqualToString:@"iPad3,1"]
++             || [deviceModel isEqualToString:@"iPad3,2"]
++             || [deviceModel isEqualToString:@"iPad3,3"]) {
++        resolutions = [self createResolutionDict:@640 frontCamHeight:@480 backCamWidth:@2592 backCamHeight:@1936];
++    }
++    // iPad 4/Air/Mini/Mini 2/Mini 3/iPod 5G
++    else if ([deviceModel isEqualToString:@"iPad3,4"]
++             || [deviceModel isEqualToString:@"iPad3,5"]
++             || [deviceModel isEqualToString:@"iPad3,6"]
++             || [deviceModel isEqualToString:@"iPad4,1"]
++             || [deviceModel isEqualToString:@"iPad4,2"]
++             || [deviceModel isEqualToString:@"iPad4,3"]
++             || [deviceModel isEqualToString:@"iPad4,4"]
++             || [deviceModel isEqualToString:@"iPad4,5"]
++             || [deviceModel isEqualToString:@"iPad4,6"]
++             || [deviceModel isEqualToString:@"iPad4,7"]
++             || [deviceModel isEqualToString:@"iPad4,8"]
++             || [deviceModel isEqualToString:@"iPod5,1"]) {
++        resolutions = [self createResolutionDict:@1280 frontCamHeight:@960 backCamWidth:@2592 backCamHeight:@1936];
++    }
++    // iPad Air 2/Mini 4/Pro
++    else if ([deviceModel isEqualToString:@"iPad5,3"]
++             || [deviceModel isEqualToString:@"iPad5,4"]) {
++        resolutions = [self createResolutionDict:@1280 frontCamHeight:@960 backCamWidth:@3264 backCamHeight:@2448];
++    }
++
++    if(resolutions == nil) {
++        // TODO: this is a fallback for deviced which are not listed (i.e. newer iPhones/iPads
++        resolutions = [self createResolutionDict:@640 frontCamHeight:@480 backCamWidth:@1280 backCamHeight:@720];
++    }
++
++    return resolutions;
++}
++
++- (NSDictionary*) resStringToDictionary: (NSString*) resString {
++
++    NSArray *resStringArray = [resString componentsSeparatedByString:@","];
++
++    int n = [resStringArray count];
++    NSMutableArray *resolutions = [NSMutableArray arrayWithCapacity:n];
++    for (int i = 0; i < n; i++) {
++        NSString *resStr = resStringArray[i];
++        NSArray *res = [resStr componentsSeparatedByString:@"x"];
++        NSDictionary *resDict = @{@"width": res[0], @"height": res[1]};
++        resolutions[i] = resDict;
++    }
++
++    return resolutions;
++}
++
+ RCT_EXPORT_METHOD(mediaStreamTrackRelease:(nonnull NSString *)streamID : (nonnull NSString *)trackID)
+ {
+   // what's different to mediaStreamTrackStop? only call mediaStream explicitly?
