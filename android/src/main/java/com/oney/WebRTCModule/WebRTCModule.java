@@ -871,24 +871,21 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         camera.takePicture(null, null, new Camera.PictureCallback() {
             @Override
             public void onPictureTaken(final byte[] jpeg, final Camera camera) {
-
+                camera.startPreview();
                 imagePorcessingHandler.post(new Runnable() {
                     @Override
                     public void run() {
                         if (captureTarget == RCT_CAMERA_CAPTURE_TARGET_MEMORY) {
                             String encoded = Base64.encodeToString(jpeg, Base64.DEFAULT);
                             successCallback.invoke(encoded);
-                            camera.startPreview();
                         } else {
                             try {
                                 String path = savePicture(jpeg, captureTarget, maxJpegQuality, maxSize, finalOrientation);
                                 successCallback.invoke(path);
-                                camera.startPreview();
                             } catch (IOException e) {
                                 String message = "Error saving picture";
                                 Log.d(TAG, message, e);
                                 errorCallback.invoke(message);
-                                camera.startPreview();
                             }
                         }
                     }
